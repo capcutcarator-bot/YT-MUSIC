@@ -1,4 +1,4 @@
-import json, os, re, tempfile, time
+import json, os, re, shutil, tempfile, time
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
@@ -35,9 +35,18 @@ def build_cookie_file():
 build_cookie_file()
 
 
+JS_RT = {}
+for _n in ("deno", "node", "bun"):
+    _p = shutil.which(_n)
+    if _p:
+        JS_RT[_n] = {"path": _p}
+
+
 def opts(**extra):
     o = {"quiet": True, "no_warnings": True, "cookiefile": COOKIE_TXT,
          "noplaylist": True, "skip_download": True}
+    if JS_RT:
+        o["js_runtimes"] = JS_RT
     o.update(extra)
     return o
 
@@ -61,15 +70,32 @@ def fmt_dur(s):
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
+CLIENTS = [None, ["tv"], ["web_safari"], ["mweb"]]
+FORMAT = "bestaudio[protocol=https]/bestaudio[ext=m4a]/bestaudio/best"
+
+
+def extract(vid):
+    last = "unknown error"
+    for clients in CLIENTS:
+        extra = {"format": FORMAT}
+        if clients:
+            extra["extractor_args"] = {"youtube": {"player_client": clients}}
+        try:
+            with YoutubeDL(opts(**extra)) as y:
+                info = y.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+            if info and info.get("url") and not str(info.get("protocol", "")).startswith("m3u8"):
+                return info
+            last = "no direct audio url found"
+        except Exception as e:
+            last = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+    raise HTTPException(502, f"Extract failed: {last[:300]}")
+
+
 def get_audio(vid):
     hit = CACHE.get(vid)
     if hit and hit["exp"] > time.time():
         return hit["data"]
-    try:
-        with YoutubeDL(opts(format="bestaudio[ext=m4a]/bestaudio/best")) as y:
-            info = y.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
-    except Exception as e:
-        raise HTTPException(502, f"Extract failed: {str(e)[:200]}")
+    info = extract(vid)
     ext = info.get("ext") or "m4a"
     data = {
         "id": vid,
@@ -93,7 +119,7 @@ def get_audio(vid):
 
 @app.get("/")
 def home():
-    return {"status": "ok", "endpoints": ["/search?q=", "/audio?id=|url=", "/stream?id=|url="]}
+    return {"status": "ok", "js_runtimes": list(JS_RT), "endpoints": ["/search?q=", "/audio?id=|url=", "/stream?id=|url="]}
 
 
 @app.get("/search")
@@ -162,4 +188,4 @@ async def stream(request: Request, id: str = None, url: str = None):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-    
+        
